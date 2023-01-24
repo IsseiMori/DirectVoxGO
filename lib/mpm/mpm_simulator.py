@@ -21,6 +21,16 @@ from mpm.mpm_integrator import (
 )
 import os
 
+@wp.kernel
+def test_kernel(
+    x : wp.array(dtype=float),
+    y : wp.array(dtype=float)):
+
+    tid = wp.tid()
+
+    y[tid] = 0.5 - x[tid]*2.0
+
+
 
 class MPMSimulator(torch.nn.Module):
     def __init__(self):
@@ -168,6 +178,7 @@ class MPMSimulator(torch.nn.Module):
             color=(125 / 255, 87 / 255, 0),
         )
         builder.init_model_state(self.model, self.state_0)
+        builder.init_model_state(self.model, self.state_1)
 
     def forward(self, v):
         grid_m_ini = torch.ones([self.model.struct.grid_dim_x, 
@@ -176,26 +187,65 @@ class MPMSimulator(torch.nn.Module):
                             dtype=torch.float32, 
                             device=self.device, 
                             requires_grad=True) * v
+
+        n_steps = 2
+        return RunSimulation.apply(grid_m_ini, self.model, self.device, self.sim_dt, n_steps, self.state_0, self.state_1)
         
-        final_grid_m = MPMSimulatorFunc.apply(self.model, self.state_0, self.state_1, self.sim_dt, self.device, grid_m_ini)
-        return final_grid_m
-        
-class MPMSimulatorFunc(torch.autograd.Function):
+
+class RunSimulation(torch.autograd.Function):
+
     @staticmethod
-    def forward(ctx, model, state_in, state_out, dt, device, grid_m_ini):
+    def forward(ctx, grid_m_ini, model, device, dt, n_steps, state_in, state_out):
 
-        n_steps = 20
-        n_substeps = 30
 
-        ctx.n_steps = n_steps
-        ctx.n_substeps = n_substeps
-        ctx.model = model
-        ctx.device = device
+        grid_m_seq = torch.zeros([n_steps-1, model.struct.grid_dim_x, model.struct.grid_dim_y, model.struct.grid_dim_z], dtype=torch.float32, device=device, requires_grad=True)
 
-        grid_m_seq = torch.zeros([n_steps, model.struct.grid_dim_x, model.struct.grid_dim_y, model.struct.grid_dim_z], dtype=torch.float32, device=device, requires_grad=True)
 
-        for i_frame in range(0, n_steps):
-            for i_step in range(0, n_substeps):
+        wp.launch(
+            zero_everything,
+            dim=int(
+                max(
+                    model.body_count,
+                    model.struct.n_particles,
+                    model.struct.grid_dim_x
+                    * model.struct.grid_dim_y
+                    * model.struct.grid_dim_z,
+                )
+            ),
+            inputs=[
+                state_in.struct,
+                state_in.ext_body_f,
+                state_in.int_body_f,
+                state_in.mpm_contact_count,
+                model.struct.grid_dim_x,
+                model.struct.grid_dim_y,
+                model.struct.grid_dim_z,
+                model.struct.n_particles,
+                model.body_count,
+            ],
+            device=device,
+        )
+
+        wp.launch(
+            set_optim_variables,
+            dim=int(
+                model.struct.grid_dim_x
+                * model.struct.grid_dim_y
+                * model.struct.grid_dim_z
+            ),
+            inputs=[
+                state_in.struct,
+                wp.torch.from_torch(grid_m_ini),
+                model.struct.grid_dim_x,
+                model.struct.grid_dim_y,
+                model.struct.grid_dim_z,],
+            device=device,
+        )
+      
+
+        for i_step in range(n_steps-1):
+
+            if i_step != 0:
 
                 state_in, state_out = state_out, state_in
 
@@ -224,119 +274,105 @@ class MPMSimulatorFunc(torch.autograd.Function):
                     device=device,
                 )
 
-                wp.launch(
-                    set_optim_variables,
-                    dim=int(
-                        model.struct.grid_dim_x
-                        * model.struct.grid_dim_y
-                        * model.struct.grid_dim_z
-                    ),
-                    inputs=[
-                        state_in.struct,
-                        wp.torch.from_torch(grid_m_ini),
-                        model.struct.grid_dim_x,
-                        model.struct.grid_dim_y,
-                        model.struct.grid_dim_z,
-                    ],
-                    device=device,
-                )
+            wp.launch(
+                set_grid_bound,
+                dim=1,
+                inputs=[model.struct, state_in.struct],
+                device=device,
+            )
 
-                wp.launch(
-                    set_grid_bound,
-                    dim=1,
-                    inputs=[model.struct, state_in.struct],
-                    device=device,
-                )
+            wp.launch(
+                create_soft_contacts,
+                dim=int(model.struct.n_particles * model.shape_count),
+                inputs=[
+                    model.struct.n_particles,
+                    state_in.struct.particle_q,
+                    state_in.body_q,
+                    model.shape_transform,
+                    model.shape_body,
+                    model.shape_geo_type,
+                    model.shape_geo_id,
+                    model.shape_geo_scale,
+                    model.mpm_contact_margin,
+                    state_in.mpm_contact_count,
+                    state_in.mpm_contact_particle,
+                    state_in.mpm_contact_body,
+                    state_in.mpm_contact_body_pos,
+                    state_in.mpm_contact_body_vel,
+                    state_in.mpm_contact_normal,
+                    model.mpm_contact_max,
+                ],
+                device=device,
+            )
 
-                wp.launch(
-                    create_soft_contacts,
-                    dim=int(model.struct.n_particles * model.shape_count),
-                    inputs=[
-                        model.struct.n_particles,
-                        state_in.struct.particle_q,
-                        state_in.body_q,
-                        model.shape_transform,
-                        model.shape_body,
-                        model.shape_geo_type,
-                        model.shape_geo_id,
-                        model.shape_geo_scale,
-                        model.mpm_contact_margin,
-                        state_in.mpm_contact_count,
-                        state_in.mpm_contact_particle,
-                        state_in.mpm_contact_body,
-                        state_in.mpm_contact_body_pos,
-                        state_in.mpm_contact_body_vel,
-                        state_in.mpm_contact_normal,
-                        model.mpm_contact_max,
-                    ],
-                    device=device,
-                )
+            wp.launch(
+                eval_soft_contacts,
+                dim=int(model.mpm_contact_max),
+                inputs=[
+                    model.struct,
+                    state_in.struct,
+                    state_in.body_q,
+                    state_in.body_qd,
+                    model.body_com,
+                    state_in.mpm_contact_count,
+                    state_in.mpm_contact_particle,
+                    state_in.mpm_contact_body,
+                    state_in.mpm_contact_body_pos,
+                    state_in.mpm_contact_body_vel,
+                    state_in.mpm_contact_normal,
+                    model.struct.particle_radius,
+                    state_in.ext_body_f,
+                ],
+                device=device,
+            )
 
-                wp.launch(
-                    eval_soft_contacts,
-                    dim=int(model.mpm_contact_max),
-                    inputs=[
-                        model.struct,
-                        state_in.struct,
-                        state_in.body_q,
-                        state_in.body_qd,
-                        model.body_com,
-                        state_in.mpm_contact_count,
-                        state_in.mpm_contact_particle,
-                        state_in.mpm_contact_body,
-                        state_in.mpm_contact_body_pos,
-                        state_in.mpm_contact_body_vel,
-                        state_in.mpm_contact_normal,
-                        model.struct.particle_radius,
-                        state_in.ext_body_f,
-                    ],
-                    device=device,
-                )
+            wp.launch(
+                p2g,
+                dim=int(model.struct.n_particles),
+                inputs=[
+                    model.struct,
+                    state_in.struct,
+                    state_out.struct,
+                    model.gravity,
+                    dt,
+                ],
+                device=device,
+            )
 
-                wp.launch(
-                    p2g,
-                    dim=int(model.struct.n_particles),
-                    inputs=[
-                        model.struct,
-                        state_in.struct,
-                        state_out.struct,
-                        model.gravity,
-                        dt,
-                    ],
-                    device=device,
-                )
+            wp.launch(
+                grid_op_with_contact,
+                dim=int(
+                    model.struct.grid_dim_x
+                    * model.struct.grid_dim_y
+                    * model.struct.grid_dim_z
+                ),
+                inputs=[
+                    model.struct,
+                    state_in.struct,
+                    dt,
+                    state_in.body_q,
+                    state_in.body_qd,
+                    model.body_com,
+                    model.shape_transform,
+                    model.shape_body,
+                    model.shape_geo_type,
+                    model.shape_geo_id,
+                    model.shape_geo_scale,
+                    model.shape_count,
+                    state_in.ext_body_f,
+                ],
+                device=device,
+            )
 
-                wp.launch(
-                    grid_op_with_contact,
-                    dim=int(
-                        model.struct.grid_dim_x
-                        * model.struct.grid_dim_y
-                        * model.struct.grid_dim_z
-                    ),
-                    inputs=[
-                        model.struct,
-                        state_in.struct,
-                        dt,
-                        state_in.body_q,
-                        state_in.body_qd,
-                        model.body_com,
-                        model.shape_transform,
-                        model.shape_body,
-                        model.shape_geo_type,
-                        model.shape_geo_id,
-                        model.shape_geo_scale,
-                        model.shape_count,
-                        state_in.ext_body_f,
-                    ],
-                    device=device,
-                )
+            wp.launch(
+                g2p,
+                dim=int(model.struct.n_particles),
+                inputs=[model.struct, state_in.struct, state_out.struct, dt],
+                device=device,
+            )
 
-                wp.launch(
-                    g2p,
-                    dim=int(model.struct.n_particles),
-                    inputs=[model.struct, state_in.struct, state_out.struct, dt],
-                    device=device,
-                )
+            # if i_step % 20 == 0:
+            if True:
 
                 final_grid_m = torch.zeros([model.struct.grid_dim_x, model.struct.grid_dim_y, model.struct.grid_dim_z], dtype=torch.float32, device=device, requires_grad=True)
                 wp.launch(
@@ -357,62 +393,30 @@ class MPMSimulatorFunc(torch.autograd.Function):
                     ],
                     device=device,
                 )
+                grid_m_seq[i_step-1] = final_grid_m
             
-            grid_m_seq[i_frame] = final_grid_m
-            
-            print(torch.argmax(torch.sum(torch.sum(final_grid_m, dim=0), dim=1)))
+                print(torch.argmax(torch.sum(torch.sum(final_grid_m, dim=0), dim=1)))
         
-        ctx.grid_m_seq = grid_m_seq
-        ctx.state_in = state_in
-
         return grid_m_seq
 
     @staticmethod
     def backward(ctx, grad_output):
 
-        # n_steps = ctx.n_steps
-        # n_substeps = ctx.n_substeps
-        # model = ctx.model
-        # device = ctx.device
-        # grid_m_seq = ctx.grid_m_seq
-
-        # state_in = ctx.state_in
-
-        # for i_frame in reversed(range(0, n_steps)):
-        #     for i_step in reversed(range(0, n_substeps)):
-
-        #         adj_x = torch.zeros_like(ctx.x).contiguous()
-
-        #         wp.launch(
-        #             extract_grad_tensor,
-        #             dim=int(
-        #                 model.struct.grid_dim_x
-        #                 * model.struct.grid_dim_y
-        #                 * model.struct.grid_dim_z
-        #             ),
-        #             inputs=[
-        #                 state_in.struct,
-        #                 model.struct.grid_dim_x,
-        #                 model.struct.grid_dim_y,
-        #                 model.struct.grid_dim_z,
-        #             ],
-        #             outputs=[
-        #                 None,
-        #             ],
-        #             adj_inputs=[wp.torch.from_torch(adj_x)],
-        #             adj_outputs=[wp.torch.from_torch(grad_output)],
-        #             device=device,
-        #             adjoint=True
-        #         )
-                
-
-        return grad_output
+        return grad_output, None, None, None, None, None, None
 
 if __name__ == "__main__":
 
     v = torch.tensor(0.5).to("cuda").requires_grad_(True)
+    v.retain_grad()
 
     simulator = MPMSimulator()
     grid_m_seq = simulator(v)
-    # 
-    print(grid_m_seq)
+
+    print(grid_m_seq.mean())
+    loss = grid_m_seq.sum()
+
+    print(loss)
+
+    loss.backward(retain_graph=True)
+    print(v)
+    print(v.grad)

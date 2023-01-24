@@ -700,51 +700,8 @@ def create_soft_contacts(
     n = wp.vec3()
     v = wp.vec3()
 
-    # GEO_SPHERE (0)
-    if geo_type == 0:
-        d = sphere_sdf(wp.vec3(), geo_scale[0], x_local)
-        n = sphere_sdf_grad(wp.vec3(), geo_scale[0], x_local)
-
-    # GEO_BOX (1)
-    if geo_type == 1:
-        d = box_sdf(geo_scale, x_local)
-        n = box_sdf_grad(geo_scale, x_local)
-
-    # GEO_CAPSULE (2)
-    if geo_type == 2:
-        d = capsule_sdf(geo_scale[0], geo_scale[1], x_local)
-        n = capsule_sdf_grad(geo_scale[0], geo_scale[1], x_local)
-
-    # GEO_MESH (3)
-    if geo_type == 3:
-        mesh = shape_geo_id[shape_index]
-
-        face_index = int(0)
-        face_u = float(0.0)
-        face_v = float(0.0)
-        sign = float(0.0)
-
-        if wp.mesh_query_point(
-            mesh,
-            x_local / geo_scale[0],
-            soft_contact_margin,
-            sign,
-            face_index,
-            face_u,
-            face_v,
-        ):
-
-            shape_p = wp.mesh_eval_position(mesh, face_index, face_u, face_v)
-            shape_v = wp.mesh_eval_velocity(mesh, face_index, face_u, face_v)
-
-            shape_p = shape_p * geo_scale[0]
-
-            delta = x_local - shape_p
-            d = wp.length(delta) * sign
-            n = wp.normalize(delta) * sign
-            v = shape_v
-
     # GEO_DENSE_VOLUME
+    # we only have this for now
     if geo_type == 7:
         volume = shape_geo_id[shape_index]
         p = x_local / geo_scale[0]
